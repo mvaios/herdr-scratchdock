@@ -94,9 +94,12 @@ herdr's pane graphics API (`pane.graphics.set`), so they render as a real image
 layer over the pane rather than as escape codes in the scrollback. That needs a
 Kitty graphics-capable outer terminal — Ghostty, Kitty, WezTerm — and
 `[terminal].kitty_graphics` left at its default. Where it is unavailable the
-preview falls back to the image's dimensions and size. Non-PNG formats are
-converted with `sips`, so inline previews of JPEG/HEIC are macOS-only; PNG works
-everywhere.
+preview falls back to the image's dimensions and size.
+
+`pane.graphics.set` refuses a frame over 512 KiB, so a PNG under that is sent
+untouched and previews on any platform. Anything larger, and any non-PNG format,
+has to be resampled first, which is done with `sips` — so those previews are
+macOS-only.
 
 Images **fit** the preview box rather than filling it. The placement rectangle
 is what herdr scales an image to, so handing it the whole box stretches a 16:9
@@ -191,8 +194,10 @@ directory.
   is the useful default. Point `SCRATCHPAD_ROOT` elsewhere for another layout.
 - The dock never writes to the scratchpad. `o` and `e` hand a file to another
   program, which is then free to do as it likes with it.
-- Inline image previews need a Kitty graphics-capable outer terminal, and
-  non-PNG formats need `sips` (macOS).
+- Inline image previews need a Kitty graphics-capable outer terminal. PNGs under
+  512 KiB preview anywhere; larger ones and other formats need `sips` (macOS).
+- `enter` selects the file inside its folder on macOS. Elsewhere `xdg-open` can
+  only open the folder itself.
 - The dock reports mouse input, so herdr hands clicks to it instead of using
   them for its own selection inside that pane.
 - Agents in the same directory at the same time share a resolution (see above).

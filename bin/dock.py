@@ -10,6 +10,8 @@ subcommands are user-facing actions and print what they did.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -83,10 +85,14 @@ def state_dir() -> Path:
     return path
 
 
-def state_file(agent_pane: str) -> Path:
+def safe_name(agent_pane: str) -> str:
     # Pane ids are `w<id>:p<n>`; the colon is legal in a filename but slashes are
     # not, so normalize anything that is not id-ish rather than trusting the shape.
-    return state_dir() / (re.sub(r"[^A-Za-z0-9_.:-]", "_", agent_pane) + ".json")
+    return re.sub(r"[^A-Za-z0-9_.:-]", "_", agent_pane)
+
+
+def state_file(agent_pane: str) -> Path:
+    return state_dir() / (safe_name(agent_pane) + ".json")
 
 
 def load_state(agent_pane: str) -> dict:
@@ -97,10 +103,45 @@ def load_state(agent_pane: str) -> dict:
 
 
 def save_state(agent_pane: str, data: dict) -> None:
+    # Write-then-rename, not write-in-place: two event hooks can be running at
+    # once, and a reader that catches a half-written file parses it as "no dock"
+    # and opens a second one.
+    path = state_file(agent_pane)
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
     try:
-        state_file(agent_pane).write_text(json.dumps(data), encoding="utf-8")
+        temporary.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(temporary, path)
     except OSError:
-        pass
+        temporary.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def dock_lock(agent_pane: str):
+    """Hold the per-pane dock lock, or yield False if another process has it.
+
+    herdr runs the event hook as a fresh process per status transition, and
+    opening a dock takes a few hundred milliseconds of snapshot, `ps` and split.
+    An agent flipping working->idle->working inside that window would otherwise
+    have two processes both find no dock and both open one.
+    """
+    path = state_dir() / (safe_name(agent_pane) + ".lock")
+    try:
+        handle = path.open("w")
+    except OSError:
+        yield True  # no lock available; better to act than to freeze
+        return
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def clear_state(agent_pane: str) -> None:
@@ -126,10 +167,16 @@ def herdr(*args: str) -> dict | None:
         return None
 
 
-def snapshot_panes() -> dict[str, dict]:
+def snapshot_panes() -> dict[str, dict] | None:
+    """Every pane by id, or None when herdr could not be asked.
+
+    The distinction matters: a failed snapshot looks exactly like "the dock pane
+    is gone" to a caller that only sees an empty dict, and acting on that would
+    forget a dock that is still on screen.
+    """
     doc = herdr("api", "snapshot")
     if not doc:
-        return {}
+        return None
     snap = doc.get("result", {}).get("snapshot", {})
     panes = {}
     # `panes` is every pane; `agents` is the agent-bearing subset and carries the
@@ -191,11 +238,16 @@ def project_slug(cwd: str) -> str:
 
 
 def birth_time(path: Path) -> float:
-    stat = path.stat()
+    # These live under /tmp and can be swept between the listing and this call.
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0.0
     born = getattr(stat, "st_birthtime", 0) or 0
     # Linux usually has no birth time; ctime is the closest stand-in for a
     # directory that is created once and never renamed.
     return float(born or stat.st_ctime)
+
 
 
 def resolve_scratchpad(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | None:
@@ -239,13 +291,20 @@ def resolve_scratchpad(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | 
 # ------------------------------------------------------------------ dock opening
 
 
-def live_dock(agent_pane: str, panes: dict[str, dict]) -> str | None:
-    """The dock pane recorded for `agent_pane`, if it is still open."""
+def live_dock(agent_pane: str, panes: dict[str, dict] | None) -> str | None:
+    """The dock pane recorded for `agent_pane`, if it is still open.
+
+    With no snapshot to check against, the recorded dock is reported as live and
+    its state is left alone. Believing a dock is gone on the strength of a failed
+    query is how a second one gets opened beside the first, with the first
+    orphaned and no longer closable.
+    """
     dock = load_state(agent_pane).get("dock_pane")
-    if dock and dock in panes:
+    if not dock:
+        return None
+    if panes is None or dock in panes:
         return dock
-    if dock:
-        clear_state(agent_pane)
+    clear_state(agent_pane)
     return None
 
 
@@ -316,12 +375,21 @@ def contains(outer: dict, inner: dict) -> bool:
         return False
 
 
-def open_dock(agent_pane: str, cfg: dict[str, str], panes: dict[str, dict]) -> tuple[bool, str]:
-    existing = live_dock(agent_pane, panes)
-    if existing:
-        return True, f"already docked in {existing}"
+def open_dock(agent_pane: str, cfg: dict[str, str], panes: dict[str, dict] | None) -> tuple[bool, str]:
+    with dock_lock(agent_pane) as held:
+        if not held:
+            # Another hook is opening this same dock right now.
+            return True, "an open is already in flight"
+        # Re-read under the lock: the process that held it may have just finished
+        # opening the dock this call was about to open.
+        existing = live_dock(agent_pane, panes if panes is not None else snapshot_panes())
+        if existing:
+            return True, f"already docked in {existing}"
+        return _open_dock_locked(agent_pane, cfg, panes)
 
-    pane = panes.get(agent_pane)
+
+def _open_dock_locked(agent_pane: str, cfg: dict[str, str], panes: dict[str, dict] | None) -> tuple[bool, str]:
+    pane = (panes or {}).get(agent_pane)
     if pane is None:
         return False, f"no such pane: {agent_pane}"
     scratchpad = resolve_scratchpad(agent_pane, pane, cfg)
@@ -351,7 +419,7 @@ def open_dock(agent_pane: str, cfg: dict[str, str], panes: dict[str, dict]) -> t
     return True, f"docked {scratchpad} in {dock_pane}"
 
 
-def close_dock(agent_pane: str, panes: dict[str, dict]) -> tuple[bool, str]:
+def close_dock(agent_pane: str, panes: dict[str, dict] | None) -> tuple[bool, str]:
     dock = live_dock(agent_pane, panes)
     if not dock:
         clear_state(agent_pane)
@@ -365,11 +433,17 @@ def close_dock(agent_pane: str, panes: dict[str, dict]) -> tuple[bool, str]:
 
 
 def opener() -> str | None:
-    for candidate in ("open", "xdg-open"):
-        for directory in os.environ.get("PATH", "").split(os.pathsep):
-            path = os.path.join(directory, candidate)
-            if os.access(path, os.X_OK):
-                return path
+    """The platform's launcher, chosen by platform rather than by PATH order.
+
+    On several Linux distributions `/usr/bin/open` is util-linux's `openvt`, so
+    preferring whichever name appears first on PATH picks a virtual-terminal tool
+    and quietly fails.
+    """
+    candidate = "open" if sys.platform == "darwin" else "xdg-open"
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        path = os.path.join(directory, candidate)
+        if os.access(path, os.X_OK):
+            return path
     return None
 
 
@@ -409,7 +483,7 @@ def open_shell(agent_pane: str, scratchpad: Path, cfg: dict[str, str]) -> tuple[
     return True, f"shell in {pane} at {scratchpad}"
 
 
-def focused_agent_pane(panes: dict[str, dict]) -> str | None:
+def focused_agent_pane(panes: dict[str, dict] | None) -> str | None:
     """The pane an action should act on: the focused pane, or its agent sibling.
 
     Actions are usually invoked from the agent pane itself, but they are just as
@@ -432,6 +506,8 @@ def focused_agent_pane(panes: dict[str, dict]) -> str | None:
             continue
         if data.get("dock_pane") == pane_id:
             return path.stem
+    if panes is None:
+        return pane_id
     return pane_id if pane_id in panes else None
 
 
@@ -494,6 +570,14 @@ def main(argv: list[str]) -> int:
         except Exception:  # noqa: BLE001 - a hook must never fail loudly
             return 0
 
+    try:
+        return run_action(mode, cfg)
+    except Exception as error:  # noqa: BLE001 - an action reports, it does not traceback
+        print(f"scratchdock: {mode} failed: {error}", file=sys.stderr)
+        return 1
+
+
+def run_action(mode: str, cfg: dict[str, str]) -> int:
     panes = snapshot_panes()
     agent_pane = focused_agent_pane(panes)
     if not agent_pane:
@@ -510,7 +594,7 @@ def main(argv: list[str]) -> int:
         else:
             ok, message = open_dock(agent_pane, cfg, panes)
     elif mode in ("path", "reveal", "copy-path", "shell"):
-        pane = panes.get(agent_pane) or {}
+        pane = (panes or {}).get(agent_pane) or {}
         scratchpad = resolve_scratchpad(agent_pane, pane, cfg)
         if scratchpad is None:
             ok, message = False, f"no scratchpad directory for {agent_pane}"

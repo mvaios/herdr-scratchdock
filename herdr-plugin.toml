@@ -14,7 +14,7 @@
 
 id = "mvaios.scratchdock"
 name = "Scratchpad Dock"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.0"
 description = "Dock the working agent's scratchpad folder in a split pane beside it."
 platforms = ["macos", "linux"]

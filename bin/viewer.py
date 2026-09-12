@@ -42,6 +42,11 @@ DOUBLE_CLICK = 0.4
 # under a terminal that negotiated one of those directly.
 ALT_ENTER = ("alt-\r", "alt-\n", "\033[13;3u", "\033[27;3;13~")
 PREVIEW_BYTES = 256 * 1024
+# `pane.graphics.set` refuses an oversized frame with `image_too_large`. Probing
+# it puts the boundary at 512 KiB: 489817 bytes was accepted and 537316 refused.
+# This sits just under, leaving room for whatever the server counts alongside the
+# pixels.
+MAX_IMAGE_BYTES = 504 * 1024
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic"}
 
@@ -169,11 +174,20 @@ def is_text(path: Path) -> bool:
         return False
     try:
         chunk.decode("utf-8")
-    except UnicodeDecodeError:
-        # A multi-byte character can straddle the 4K boundary; that alone is not
-        # enough to call a file binary.
-        return chunk.count(b"\xef\xbf\xbd") == 0 and len(chunk) == 4096
-    return True
+        return True
+    except UnicodeDecodeError as error:
+        # A multi-byte character can straddle the end of the read, and a file cut
+        # mid-character is still text. Anything failing earlier than the last
+        # three bytes is a genuinely non-UTF-8 byte, not a clipped one.
+        if error.start >= len(chunk) - 3:
+            return True
+
+    # Not UTF-8, but a note saved in a legacy encoding is still something worth
+    # reading, and the preview decodes with replacement anyway. Take it when
+    # nearly every byte is one a text file would plausibly hold; a blob that
+    # happens to contain no NUL fails this on its control bytes.
+    textish = sum(1 for byte in chunk if 0x20 <= byte < 0x7F or byte in (9, 10, 13) or byte >= 0xA0)
+    return bool(chunk) and textish >= len(chunk) * 0.95
 
 
 def png_dimensions(path: Path) -> tuple[int, int] | None:
@@ -187,10 +201,34 @@ def png_dimensions(path: Path) -> tuple[int, int] | None:
     return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
 
 
+_dimension_cache: dict[tuple[str, float], tuple[int, int] | None] = {}
+
+
 def image_dimensions(path: Path) -> tuple[int, int] | None:
+    """Pixel size of an image, memoised on (path, mtime).
+
+    This is called from `preview_lines`, which runs on every repaint — every
+    `j` and `k` included. For a PNG that is a header read, but for anything else
+    it shells out to `sips`, and one subprocess per keystroke would block the
+    input loop. The answer only changes when the file does.
+    """
     dimensions = png_dimensions(path)
     if dimensions:
         return dimensions
+    try:
+        key = (str(path), path.stat().st_mtime)
+    except OSError:
+        return None
+    if key in _dimension_cache:
+        return _dimension_cache[key]
+    measured = _measure_image(path)
+    if len(_dimension_cache) > 64:
+        _dimension_cache.clear()
+    _dimension_cache[key] = measured
+    return measured
+
+
+def _measure_image(path: Path) -> tuple[int, int] | None:
     # sips is macOS-only and every other reader is a third-party dependency, so
     # elsewhere the preview simply goes without a pixel size.
     try:
@@ -251,28 +289,31 @@ def cell_size() -> tuple[int, int]:
     return _cell_size
 
 
-def scaled_png(path: Path, box_px: tuple[int, int]) -> tuple[bytes, int, int] | None:
-    """PNG bytes scaled to fit `box_px`, with its dimensions.
+def image_payload(path: Path, box_px: tuple[int, int]) -> tuple[bytes, int, int] | None:
+    """PNG bytes small enough to send, with the dimensions of those bytes.
 
-    Scaling is not just politeness: the graphics API refuses an oversized frame
-    with `image_too_large`, and a full-resolution screenshot clears that bar
-    easily. Fitting the preview box first keeps every payload small and makes the
-    image land at the pane's real resolution instead of being squashed by the
-    terminal.
+    Resizing here is only ever about the payload cap — herdr scales the image to
+    the placement rectangle itself, so a bigger PNG buys nothing. A PNG that is
+    already under the cap is therefore sent untouched, which is what makes image
+    previews work on a machine without `sips` (that is, on Linux).
     """
-    source = image_dimensions(path)
-    suffix = path.suffix.lower()
-    target = None
-    if source and source[0] > 0 and source[1] > 0:
-        scale = min(box_px[0] / source[0], box_px[1] / source[1], 1.0)
-        target = max(1, round(max(source) * scale))
-
-    if suffix == ".png" and target is None:
+    if path.suffix.lower() == ".png":
         try:
             data = path.read_bytes()
         except OSError:
             return None
-        return (data, *(source or (0, 0)))
+        dimensions = png_header_dimensions(data)
+        if dimensions and len(data) <= MAX_IMAGE_BYTES:
+            return (data, *dimensions)
+        if not dimensions:
+            return None
+        # Over the cap: the only way down is a resample, which needs sips.
+
+    source = image_dimensions(path)
+    target = None
+    if source and source[0] > 0 and source[1] > 0:
+        scale = min(box_px[0] / source[0], box_px[1] / source[1], 1.0)
+        target = max(1, round(max(source) * scale))
 
     converted = Path(os.environ.get("TMPDIR", "/tmp")) / f"scratchdock-{os.getpid()}.png"
     argv = ["sips", "-s", "format", "png"]
@@ -287,7 +328,7 @@ def scaled_png(path: Path, box_px: tuple[int, int]) -> tuple[bytes, int, int] | 
     except (OSError, subprocess.SubprocessError):
         return None
     dimensions = png_header_dimensions(data)
-    if not dimensions:
+    if not dimensions or len(data) > MAX_IMAGE_BYTES:
         return None
     return (data, *dimensions)
 
@@ -303,24 +344,27 @@ def place_image(path: Path, box: tuple[int, int, int, int]) -> bool:
 
     The placement rectangle is what herdr scales the image to, so handing it the
     whole preview box stretches a 16:9 screenshot into whatever shape the pane
-    happens to be. Instead the image is scaled to *fit* the box with its aspect
-    intact, and the rectangle is then cut down to the cells that image actually
-    occupies and centred in the space. What is left over stays pane background —
-    letterboxing, not stretching.
+    happens to be. Instead the rectangle is cut down to the cells the image's own
+    aspect ratio occupies and centred in the space, leaving pane background
+    around it — letterboxing, not stretching. The arithmetic runs off the
+    dimensions of the bytes being sent, so it holds whether or not those bytes
+    were resampled on the way here.
     """
     col, row, cols, rows = box
     cell_w, cell_h = cell_size()
-    scaled = scaled_png(path, (cols * cell_w, rows * cell_h))
-    if not scaled:
+    payload = image_payload(path, (cols * cell_w, rows * cell_h))
+    if not payload:
         return False
-    data, width, height = scaled
-    if len(data) > 512 * 1024:
+    data, width, height = payload
+    if width <= 0 or height <= 0:
         return False
 
+    # Never upscale: a small image stays small rather than being blown up blurry.
+    scale = min(cols * cell_w / width, rows * cell_h / height, 1.0)
     # Round to the nearest cell rather than up: half a cell of slack in each
     # direction is invisible, while a whole spare cell is a visible band.
-    used_cols = max(1, min(cols, round(width / cell_w)))
-    used_rows = max(1, min(rows, round(height / cell_h)))
+    used_cols = max(1, min(cols, round(width * scale / cell_w)))
+    used_rows = max(1, min(rows, round(height * scale / cell_h)))
     reply = socket_request(
         "pane.graphics.set",
         {
@@ -368,11 +412,13 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 def opener() -> str | None:
-    for candidate in ("open", "xdg-open"):
-        path = shutil_which(candidate)
-        if path:
-            return path
-    return None
+    """The platform's launcher, chosen by platform rather than by PATH order.
+
+    Not a search across both names: on several Linux distributions `/usr/bin/open`
+    is util-linux's `openvt`, so preferring whichever appears first on PATH picks
+    a virtual-terminal tool and quietly fails.
+    """
+    return shutil_which("open" if sys.platform == "darwin" else "xdg-open")
 
 
 def shutil_which(name: str) -> str | None:
@@ -419,6 +465,7 @@ class Viewer:
         self.last_draw = 0.0
         self.image_shown = False
         self.image_key: tuple | None = None
+        self.image_box: tuple[int, int, int, int] | None = None
         self.dirty = True
         self.inbuf = b""
         self.last_click = 0.0
@@ -476,7 +523,9 @@ class Viewer:
         if not launcher:
             self.say("no opener (open/xdg-open) on PATH")
             return
-        if launcher.endswith("open") and entry is not None:
+        # Only macOS `open` understands -R, and only it can select a file inside
+        # its folder. Elsewhere the closest thing is opening the folder itself.
+        if sys.platform == "darwin" and entry is not None:
             run_detached([launcher, "-R", str(target)])
         else:
             run_detached([launcher, str(target if target.is_dir() else target.parent)])
@@ -641,17 +690,23 @@ class Viewer:
 
         body_height = height - 4  # header, count, blank, footer
         image: Path | None = None
+        self.image_box = None
 
         self.tree_first_row = 4
         self.tree_height = 0
+        # A split pane can be short enough that a tree and a preview do not both
+        # fit. Below that, the tree gets the whole body rather than the preview
+        # borrowing rows the tree does not have.
+        split = self.preview_on and self.rows and body_height >= 5
         if self.help_on:
             for line in self.help_lines(width)[:body_height]:
                 out.append(line + "\n")
-        elif self.preview_on and self.rows:
-            tree_height = max(3, min(len(self.rows), (body_height - 2) // 2))
+        elif split:
+            tree_height = max(1, min(len(self.rows), (body_height - 2) // 2))
             self.tree_height = tree_height
             preview_height = body_height - tree_height - 1
-            for line in self.tree_lines(width, tree_height):
+            tree = self.tree_lines(width, tree_height)
+            for line in tree:
                 out.append(line + "\n")
             entry = self.current()
             title = fit(entry.path.name, max(0, width - 4)) if entry else ""
@@ -659,6 +714,11 @@ class Viewer:
             lines, image = self.preview_lines(width, preview_height)
             for line in lines[:preview_height]:
                 out.append(line + "\n")
+            # Measure from the rows actually emitted, not from the budget: a tree
+            # with fewer entries than its allowance ends higher up, and an image
+            # placed against the allowance would float below its own caption.
+            first_row = 3 + len(tree) + 1 + 1  # tree, separator, the size line
+            self.image_box = (0, first_row, max(1, width), max(1, height - 1 - first_row))
         else:
             self.tree_height = body_height
             for line in self.tree_lines(width, body_height):
@@ -671,28 +731,23 @@ class Viewer:
 
         # The graphics layer is composited by herdr and outlives the text frame,
         # so it is only touched when what it should show actually changes.
-        if image is None:
+        if image is None or self.image_box is None:
             if self.image_shown:
                 clear_image()
                 self.image_shown = False
                 self.image_key = None
             return
-        self.draw_image(image, width, height, body_height)
+        self.draw_image(image, self.image_box)
 
-    def draw_image(self, path: Path, width: int, height: int, body_height: int) -> None:
-        tree_height = max(3, min(len(self.rows), (body_height - 2) // 2))
-        # header, counts, blank, tree, separator, then the line naming the size.
-        first_row = 3 + tree_height + 2
-        rows = max(1, height - 1 - first_row)
-        cols = max(1, width)
+    def draw_image(self, path: Path, box: tuple[int, int, int, int]) -> None:
         try:
             stamp = path.stat().st_mtime
         except OSError:
             return
-        key = (str(path), stamp, first_row, rows, cols)
+        key = (str(path), stamp, box)
         if key == self.image_key:
             return
-        if place_image(path, (0, first_row, cols, rows)):
+        if place_image(path, box):
             self.image_shown = True
             self.image_key = key
         else:
