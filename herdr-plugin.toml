@@ -1,0 +1,92 @@
+# herdr-plugin.toml — manifest for scratchdock.
+#
+# Docks a coding agent's scratchpad directory in a split pane beside the agent
+# while it works. The scratchpad is the per-session temp directory Claude Code
+# is told to use for intermediate files
+# (`/tmp/claude-<uid>/<cwd-slug>/<session-uuid>/scratchpad`); nothing in herdr
+# or the marketplace surfaces it, so the agent's working files stay invisible.
+#
+# The dock opens from an event hook on `pane.agent_status_changed` (default: on
+# `working`) and from the `toggle` action, and it is idempotent per agent pane:
+# a second event while the dock is open is a no-op, so a chatty agent does not
+# stack panes. State lives in HERDR_PLUGIN_STATE_DIR, user config in
+# HERDR_PLUGIN_CONFIG_DIR/config.env (see config.example.env).
+
+id = "mvaios.scratchdock"
+name = "Scratchpad Dock"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Dock the working agent's scratchpad folder in a split pane beside it."
+platforms = ["macos", "linux"]
+
+# The dock pane. `--cwd` at open time is what roots the viewer at the resolved
+# scratchpad directory; the manifest command only picks *which* viewer runs.
+[[panes]]
+id = "dock"
+title = "Scratchpad"
+placement = "split"
+# Absolute via HERDR_PLUGIN_ROOT, not a relative path: `--cwd` at open time makes
+# the pane's working directory the scratchpad, so a relative `bin/viewer.sh` would
+# resolve against the scratchpad and the pane would exit before it drew anything.
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/viewer.sh\""]
+
+# Auto-open. herdr emits this on every agent state transition; dock.py filters
+# by status and agent, so the hook stays cheap for the transitions we ignore.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "bin/dock.sh", "event"]
+
+# Close the dock when its agent pane goes away, so a closed agent does not leave
+# an orphaned viewer behind.
+[[events]]
+on = "pane.closed"
+command = ["bash", "bin/dock.sh", "event"]
+
+[[actions]]
+id = "toggle"
+title = "Scratchpad dock: toggle"
+description = "Open the focused agent's scratchpad beside it, or close it if already docked."
+contexts = ["pane", "workspace"]
+command = ["bash", "bin/dock.sh", "toggle"]
+
+[[actions]]
+id = "open"
+title = "Scratchpad dock: open"
+description = "Open the focused agent's scratchpad directory in a split pane."
+contexts = ["pane", "workspace"]
+command = ["bash", "bin/dock.sh", "open"]
+
+[[actions]]
+id = "close"
+title = "Scratchpad dock: close"
+description = "Close the scratchpad dock for the focused agent pane."
+contexts = ["pane", "workspace"]
+command = ["bash", "bin/dock.sh", "close"]
+
+[[actions]]
+id = "reveal"
+title = "Scratchpad dock: reveal folder"
+description = "Open the focused agent's scratchpad directory in the file manager."
+contexts = ["pane", "workspace"]
+command = ["bash", "bin/dock.sh", "reveal"]
+
+[[actions]]
+id = "copy-path"
+title = "Scratchpad dock: copy folder path"
+description = "Copy the focused agent's scratchpad directory path to the clipboard."
+contexts = ["pane", "workspace"]
+command = ["bash", "bin/dock.sh", "copy-path"]
+
+[[actions]]
+id = "shell"
+title = "Scratchpad dock: open a shell there"
+description = "Open a shell pane with the focused agent's scratchpad as its working directory."
+contexts = ["pane", "workspace"]
+command = ["bash", "bin/dock.sh", "shell"]
+
+[[actions]]
+id = "path"
+title = "Scratchpad dock: print path"
+description = "Print the scratchpad directory herdr would dock for the focused agent pane."
+contexts = ["pane", "workspace"]
+command = ["bash", "bin/dock.sh", "path"]
