@@ -37,7 +37,26 @@ herdr plugin link /path/to/herdr-scratchdock
 macOS and Linux. Needs `python3` on `PATH` (set `SCRATCHDOCK_PYTHON` if yours
 lives somewhere unusual). No build step, no dependencies.
 
-## How it finds the scratchpad
+## What it docks, per agent
+
+| Agent | Directory |
+| --- | --- |
+| Claude Code | the session scratchpad, `/tmp/claude-<uid>/<cwd-slug>/<session-uuid>/scratchpad` |
+| Codex | that thread's images, `~/.codex/generated_images/<thread-id>` |
+
+An agent without a resolver docks nothing. That is deliberate: the two layouts
+have nothing in common, and falling back to the other one would put a Claude
+session's scratchpad beside a Codex pane.
+
+Codex has no scratchpad directory — it writes working files into the repo — but
+it does keep generated images per thread, and the thread is identifiable
+*exactly* rather than by inference. Every rollout at
+`~/.codex/sessions/<y>/<m>/<d>/rollout-<timestamp>-<thread-id>.jsonl` opens with
+a `session_meta` record carrying that thread's `cwd`; matching the pane's cwd
+against it names the thread, and the filename timestamps order the candidates.
+No birth-time heuristic of the kind Claude Code needs.
+
+## How it finds the Claude scratchpad
 
 An agent pane gives you a cwd, not a session id, and one project accumulates a
 session directory per run. scratchdock narrows it in two steps:
@@ -159,11 +178,12 @@ cp config.example.env "$(herdr plugin config-dir mvaios.scratchdock)/config.env"
 | --- | --- | --- |
 | `OPEN_ON` | `working` | Statuses that open the dock. Empty disables auto-open. |
 | `CLOSE_ON` | *(empty)* | Statuses that close it. Try `idle,done` for a dock that comes and goes. |
-| `AGENTS` | `claude` | Agents to dock for, or `*` for all. |
+| `AGENTS` | `claude,codex` | Agents to dock for, or `*` for every agent with a resolver. |
 | `DIRECTION` | `right` | `right` or `down`. |
 | `RATIO` | `0.32` | Share of the split the dock takes. |
 | `FOCUS` | `0` | `1` to focus the dock when it opens. |
 | `SCRATCHPAD_ROOT` | *(empty)* | Override `/tmp/claude-<uid>`. |
+| `CODEX_HOME` | *(empty)* | Override `~/.codex`. |
 | `VIEWER` | `builtin` | See below. |
 
 Every key also works as an environment variable with a `SCRATCHDOCK_` prefix.
@@ -190,8 +210,10 @@ directory.
 
 ## Limits
 
-- Only Claude Code keeps a per-session scratchpad directory, so `AGENTS=claude`
-  is the useful default. Point `SCRATCHPAD_ROOT` elsewhere for another layout.
+- For Codex the dock shows generated images only — that is the one place Codex
+  keeps per-thread output. Its other working files land in the repo.
+- Codex screenshots run past the 512 KiB inline limit, so those previews need
+  `sips` and are macOS-only.
 - The dock never writes to the scratchpad. `o` and `e` hand a file to another
   program, which is then free to do as it likes with it.
 - Inline image previews need a Kitty graphics-capable outer terminal. PNGs under
@@ -200,7 +222,8 @@ directory.
   only open the folder itself.
 - The dock reports mouse input, so herdr hands clicks to it instead of using
   them for its own selection inside that pane.
-- Agents in the same directory at the same time share a resolution (see above).
+- Two Claude agents in the same directory at the same time share a resolution
+  (see above). Codex does not have this problem.
 
 ## License
 

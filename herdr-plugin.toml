@@ -14,9 +14,9 @@
 
 id = "mvaios.scratchdock"
 name = "Scratchpad Dock"
-version = "0.1.1"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
-description = "Dock the working agent's scratchpad folder in a split pane beside it."
+description = "Dock the working agent's working files in a split pane beside it — Claude Code scratchpads and Codex generated images."
 platforms = ["macos", "linux"]
 
 # The dock pane. `--cwd` at open time is what roots the viewer at the resolved

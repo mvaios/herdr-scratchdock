@@ -34,8 +34,8 @@ DEFAULTS = {
     # Statuses that close it again. Empty by default: the scratchpad is most
     # interesting *after* the agent stops, so the dock stays until dismissed.
     "CLOSE_ON": "",
-    # Agents to dock for. "*" for any agent herdr detects.
-    "AGENTS": "claude",
+    # Agents to dock for. "*" for any agent that has a resolver below.
+    "AGENTS": "claude,codex",
     "DIRECTION": "right",
     # Fraction of the split the dock takes. herdr splits 50/50; a file list does
     # not need half the window, and the agent pane is the one you read.
@@ -43,10 +43,15 @@ DEFAULTS = {
     "FOCUS": "0",
     # Override the scratchpad root; default is /tmp/claude-<uid>.
     "SCRATCHPAD_ROOT": "",
+    # Override Codex's home; default is ~/.codex.
+    "CODEX_HOME": "",
 }
 
 # argv0 basenames that count as the agent process inside a pane, per herdr agent id.
-AGENT_BINS = {"claude": ("claude",)}
+AGENT_BINS = {"claude": ("claude",), "codex": ("codex",)}
+
+# How many rollout files back to look when matching a Codex thread to a pane.
+CODEX_SCAN_LIMIT = 300
 
 
 # ---------------------------------------------------------------- config/state
@@ -198,7 +203,10 @@ def agent_pid(pane_id: str, agent: str) -> int | None:
     for proc in procs:
         argv = proc.get("argv") or []
         argv0 = proc.get("argv0") or (argv[0] if argv else "")
-        if os.path.basename(argv0) in names:
+        # argv0 first, then the rest of argv: a Node-based CLI is spawned as
+        # `node /path/to/bin/codex`, where the name is in argv[1], not argv0.
+        names_seen = [os.path.basename(argv0)] + [os.path.basename(a) for a in argv[1:3]]
+        if any(name in names for name in names_seen):
             pid = proc.get("pid")
             return int(pid) if isinstance(pid, int) else None
     return None
@@ -250,7 +258,7 @@ def birth_time(path: Path) -> float:
 
 
 
-def resolve_scratchpad(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | None:
+def resolve_claude_scratchpad(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | None:
     """The scratchpad directory of the agent session running in `pane_id`.
 
     Sessions are per-process and per-cwd, so the cwd narrows the candidates to one
@@ -286,6 +294,91 @@ def resolve_scratchpad(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | 
         except OSError:
             return session if session.is_dir() else None
     return scratchpad
+
+
+def codex_home(cfg: dict[str, str]) -> Path:
+    if cfg["CODEX_HOME"]:
+        return Path(cfg["CODEX_HOME"]).expanduser()
+    return Path.home() / ".codex"
+
+
+def resolve_codex_images(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | None:
+    """The generated-images directory of the Codex thread running in `pane_id`.
+
+    Codex has no scratchpad directory, but it does keep per-thread output at
+    `~/.codex/generated_images/<thread-id>/`, and the thread is identifiable
+    exactly rather than by guesswork: every rollout at
+    `~/.codex/sessions/<y>/<m>/<d>/rollout-<timestamp>-<thread-id>.jsonl` opens
+    with a `session_meta` record carrying that thread's `cwd`. Matching the
+    pane's cwd against it gives the thread, and the filename timestamp orders
+    the candidates — no birth-time inference of the kind Claude Code needs.
+    """
+    cwd = pane.get("cwd") or pane.get("foreground_cwd")
+    if not cwd:
+        return None
+    home = codex_home(cfg)
+    try:
+        # Filenames start with an ISO timestamp, so lexical order is time order.
+        rollouts = sorted(
+            (home / "sessions").rglob("rollout-*.jsonl"),
+            key=lambda path: path.name,
+            reverse=True,
+        )[:CODEX_SCAN_LIMIT]
+    except OSError:
+        return None
+
+    thread = None
+    for rollout in rollouts:
+        try:
+            with rollout.open(encoding="utf-8", errors="replace") as handle:
+                meta = json.loads(handle.readline())
+        except (OSError, ValueError):
+            continue
+        payload = meta.get("payload") if isinstance(meta.get("payload"), dict) else meta
+        if not isinstance(payload, dict) or payload.get("cwd") != cwd:
+            continue
+        thread = payload.get("session_id") or payload.get("id")
+        if thread:
+            break
+    if not thread:
+        return None
+
+    images = home / "generated_images" / str(thread)
+    if not images.is_dir():
+        # Codex creates this on its first image. Creating it here lets the dock
+        # open when work starts rather than when the first picture lands.
+        try:
+            images.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+    return images
+
+
+# Agents whose working files can be found, and how. An agent that is not here
+# resolves to nothing rather than to some other agent's directory.
+RESOLVERS = {
+    "claude": resolve_claude_scratchpad,
+    "codex": resolve_codex_images,
+}
+
+
+def resolve_source(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | None:
+    resolver = RESOLVERS.get(pane.get("agent") or "")
+    if resolver is None:
+        return None
+    return resolver(pane_id, pane, cfg)
+
+
+def source_label(pane: dict, source: Path) -> str:
+    """What the dock calls itself, since the path alone does not read well.
+
+    A Claude scratchpad is `<session-uuid>/scratchpad`, where the directory name
+    is the useful half; a Codex images directory is named for the thread and
+    sits under `generated_images`, where it is the parent that means something.
+    """
+    if (pane.get("agent") or "") == "codex":
+        return f"codex images · {source.name[:8]}"
+    return f"{source.name} · {source.parent.name[:8]}"
 
 
 # ------------------------------------------------------------------ dock opening
@@ -392,7 +485,7 @@ def _open_dock_locked(agent_pane: str, cfg: dict[str, str], panes: dict[str, dic
     pane = (panes or {}).get(agent_pane)
     if pane is None:
         return False, f"no such pane: {agent_pane}"
-    scratchpad = resolve_scratchpad(agent_pane, pane, cfg)
+    scratchpad = resolve_source(agent_pane, pane, cfg)
     if scratchpad is None:
         return False, f"no scratchpad directory for {agent_pane}"
 
@@ -406,6 +499,7 @@ def _open_dock_locked(agent_pane: str, cfg: dict[str, str], panes: dict[str, dic
         "--cwd", str(scratchpad),
         "--env", f"SCRATCHDOCK_DIR={scratchpad}",
         "--env", f"SCRATCHDOCK_AGENT_PANE={agent_pane}",
+        "--env", f"SCRATCHDOCK_LABEL={source_label(pane, scratchpad)}",
         "--focus" if cfg["FOCUS"] == "1" else "--no-focus",
     )
     dock_pane = (
@@ -595,7 +689,7 @@ def run_action(mode: str, cfg: dict[str, str]) -> int:
             ok, message = open_dock(agent_pane, cfg, panes)
     elif mode in ("path", "reveal", "copy-path", "shell"):
         pane = (panes or {}).get(agent_pane) or {}
-        scratchpad = resolve_scratchpad(agent_pane, pane, cfg)
+        scratchpad = resolve_source(agent_pane, pane, cfg)
         if scratchpad is None:
             ok, message = False, f"no scratchpad directory for {agent_pane}"
         elif mode == "path":

@@ -27,6 +27,10 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("SCRATCHDOCK_DIR") or os.getcwd())
 AGENT_PANE = os.environ.get("SCRATCHDOCK_AGENT_PANE") or ""
+# What the header calls this directory. The dock is handed one because the path
+# alone does not read well for either agent: a Claude scratchpad is named for
+# its session, a Codex images directory for its thread.
+LABEL = os.environ.get("SCRATCHDOCK_LABEL") or ""
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
 
 POLL = 0.25          # input responsiveness
@@ -679,10 +683,10 @@ class Viewer:
         now = time.time()
         out = ["\033[H\033[2J"]
 
-        label = ROOT.name
-        session = ROOT.parent.name
-        if session:
-            label = f"{label} {DIM}·{RESET}{BOLD} {session[:8]}"
+        label = LABEL or f"{ROOT.name} · {ROOT.parent.name[:8]}"
+        if " · " in label:
+            head, _, tail = label.partition(" · ")
+            label = f"{head} {DIM}·{RESET}{BOLD} {tail}"
         files = sum(1 for row in self.rows if not row.is_dir)
         total = sum(row.size for row in self.rows if not row.is_dir)
         out.append(f"{BOLD}{label}{RESET}\n")
