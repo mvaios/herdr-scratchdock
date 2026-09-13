@@ -26,6 +26,23 @@ import tty
 from pathlib import Path
 
 ROOT = Path(os.environ.get("SCRATCHDOCK_DIR") or os.getcwd())
+
+
+def _sources() -> list["Source"]:
+    """What this dock watches, from SCRATCHDOCK_SOURCES, else just its own cwd."""
+    import json as _json
+
+    raw = os.environ.get("SCRATCHDOCK_SOURCES") or ""
+    if raw:
+        try:
+            return [
+                Source(item.get("label") or "", item.get("kind") or "dir", Path(item["root"]))
+                for item in _json.loads(raw)
+                if item.get("root")
+            ]
+        except (ValueError, KeyError, TypeError):
+            pass
+    return [Source(ROOT.name, "dir", ROOT)]
 AGENT_PANE = os.environ.get("SCRATCHDOCK_AGENT_PANE") or ""
 # What the header calls this directory. The dock is handed one because the path
 # alone does not read well for either agent: a Claude scratchpad is named for
@@ -118,16 +135,66 @@ def fit(text: str, width: int) -> str:
 
 
 class Entry:
-    __slots__ = ("path", "depth", "is_dir", "size", "mtime")
+    __slots__ = ("path", "depth", "is_dir", "size", "mtime", "status", "is_group", "label")
 
-    def __init__(self, path: Path, depth: int, is_dir: bool, size: int, mtime: float):
+    def __init__(self, path: Path, depth: int, is_dir: bool, size: int, mtime: float,
+                 status: str = "", is_group: bool = False, label: str = ""):
         self.path, self.depth, self.is_dir = path, depth, is_dir
         self.size, self.mtime = size, mtime
+        # A git status code (`??`, ` M`, `A `…) for a working-tree row, empty
+        # otherwise; `is_group` marks the header of a source.
+        self.status, self.is_group = status, is_group
+        self.label = label or path.name
 
 
-def scan(root: Path, collapsed: set[Path]) -> list[Entry]:
+class Source:
+    """One directory the dock watches, and how to enumerate it."""
+
+    __slots__ = ("label", "kind", "root")
+
+    def __init__(self, label: str, kind: str, root: Path):
+        self.label, self.kind, self.root = label, kind, root
+
+
+def git_changes(root: Path, limit: int = 300) -> list[tuple[str, Path]]:
+    """(status, path) for everything the working tree has gained or changed.
+
+    `--porcelain` already skips ignored files, which is the filter wanted here:
+    build output and vendored trees are not what the agent just made. A rename
+    is reported as two NUL-separated fields; only the new path is interesting.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+
+    fields = proc.stdout.split(b"\0")
+    changes: list[tuple[str, Path]] = []
+    index = 0
+    while index < len(fields) and len(changes) < limit:
+        field = fields[index]
+        index += 1
+        if len(field) < 4:
+            continue
+        status = field[:2].decode("ascii", "replace")
+        name = field[3:].decode("utf-8", "replace")
+        if status[0] == "R":
+            index += 1  # the rename's source path, which we do not show
+        changes.append((status, root / name))
+    return changes
+
+
+def scan(sources: list[Source], collapsed: set[Path]) -> list[Entry]:
     rows: list[Entry] = []
     budget = [MAX_ENTRIES]
+    # A single source keeps the flat, un-headed layout: a group header over the
+    # only thing on screen is pure noise.
+    grouped = len(sources) > 1
 
     def walk(directory: Path, depth: int) -> None:
         if budget[0] <= 0 or depth >= MAX_DEPTH:
@@ -157,12 +224,35 @@ def scan(root: Path, collapsed: set[Path]) -> list[Entry]:
             if is_dir and path not in collapsed:
                 walk(path, depth + 1)
 
-    walk(root, 0)
+    for source in sources:
+        base = 0
+        if grouped:
+            rows.append(Entry(source.root, 0, True, 0, 0.0, is_group=True, label=source.label))
+            base = 1
+            if source.root in collapsed:
+                continue
+        if source.kind == "git":
+            changes = []
+            for status, path in git_changes(source.root):
+                try:
+                    stat = path.stat()
+                    size, mtime = stat.st_size, stat.st_mtime
+                except OSError:
+                    size, mtime = 0, 0.0  # deleted, or gone since git looked
+                changes.append(Entry(path, base, False, size, mtime, status=status.strip()))
+            changes.sort(key=lambda entry: entry.mtime, reverse=True)
+            rows.extend(changes)
+        else:
+            before = len(rows)
+            walk(source.root, 0)
+            if base:
+                for entry in rows[before:]:
+                    entry.depth += base
     return rows
 
 
 def signature(rows: list[Entry]) -> tuple:
-    return tuple((str(r.path), r.is_dir, r.size, r.mtime) for r in rows)
+    return tuple((str(r.path), r.is_dir, r.size, r.mtime, r.status, r.is_group) for r in rows)
 
 
 # -------------------------------------------------------------------- preview
@@ -457,6 +547,7 @@ HELP = [
 
 class Viewer:
     def __init__(self) -> None:
+        self.sources = _sources()
         self.rows: list[Entry] = []
         self.collapsed: set[Path] = set()
         self.selected = 0
@@ -486,7 +577,7 @@ class Viewer:
 
     def rescan(self) -> None:
         keep = self.current()
-        self.rows = scan(ROOT, self.collapsed)
+        self.rows = scan(self.sources, self.collapsed)
         current = signature(self.rows)
         if current != self.signature:
             self.signature = current
@@ -576,7 +667,7 @@ class Viewer:
         entry = self.current()
         if entry is None:
             return
-        if entry.is_dir:
+        if entry.is_dir or entry.is_group:
             if entry.path in self.collapsed:
                 self.collapsed.discard(entry.path)
             else:
@@ -610,16 +701,25 @@ class Viewer:
         for index in range(self.top, min(len(self.rows), self.top + height)):
             row = self.rows[index]
             age = now - row.mtime
-            fresh = age < FRESH
+            fresh = age < FRESH and not row.is_group
             indent = "  " * row.depth
-            name = row.path.name + "/" if row.is_dir else row.path.name
-            if row.is_dir and row.path in self.collapsed:
-                name += " …"
-            right = "" if row.is_dir else f"{human_size(row.size):>7} {human_age(age):>4}"
+            collapsed = row.path in self.collapsed
+
+            if row.is_group:
+                name = f"{'▸' if collapsed else '▾'} {row.label}"
+                right = ""
+            else:
+                name = row.label + "/" if row.is_dir else row.label
+                if row.is_dir and collapsed:
+                    name += " …"
+                right = "" if row.is_dir else f"{human_size(row.size):>7} {human_age(age):>4}"
 
             # Lay the row out in plain text, then paint it: escape codes have no
             # width, and mixing them into the arithmetic is how columns drift.
-            prefix = f"{'●' if fresh else ' '} {indent}"
+            # The status column is part of the prefix so names still line up.
+            mark = "●" if fresh else " "
+            status = f"{row.status:<2} " if row.status else ""
+            prefix = f"{mark} {indent}{status}"
             room = width - len(prefix) - len(right) - 1
             if room < 4:
                 lines.append(fit(prefix + name, width))
@@ -627,17 +727,19 @@ class Viewer:
             name = fit(name, room)
             gap = " " * (width - len(prefix) - len(name) - len(right))
 
-            if row.is_dir:
+            if row.is_group:
+                painted = f"{BOLD}{name}{RESET}"
+            elif row.is_dir:
                 painted = f"{CYAN}{name}{RESET}"
             elif fresh:
                 painted = f"{BOLD}{name}{RESET}"
             else:
                 painted = name
             marker = f"{GREEN}●{RESET}" if fresh else " "
-            body = f"{marker} {indent}{painted}{gap}{DIM}{right}{RESET}"
+            painted_status = f"{YELLOW}{row.status:<2}{RESET} " if row.status else ""
+            body = f"{marker} {indent}{painted_status}{painted}{gap}{DIM}{right}{RESET}"
             if index == self.selected:
-                plain = f"{'●' if fresh else ' '} {indent}{name}{gap}{right}"
-                body = f"{REVERSE}{plain}{RESET}"
+                body = f"{REVERSE}{prefix}{name}{gap}{right}{RESET}"
             lines.append(body)
         return lines
 
@@ -646,6 +748,10 @@ class Viewer:
         entry = self.current()
         if entry is None:
             return [], None
+        if entry.is_group:
+            kind = next((s.kind for s in self.sources if s.root == entry.path), "dir")
+            what = "working tree changes" if kind == "git" else "directory"
+            return [f"{DIM}{what} · {entry.path}{RESET}"], None
         if entry.is_dir:
             try:
                 count = len(list(os.scandir(entry.path)))
@@ -687,8 +793,8 @@ class Viewer:
         if " · " in label:
             head, _, tail = label.partition(" · ")
             label = f"{head} {DIM}·{RESET}{BOLD} {tail}"
-        files = sum(1 for row in self.rows if not row.is_dir)
-        total = sum(row.size for row in self.rows if not row.is_dir)
+        files = sum(1 for row in self.rows if not row.is_dir and not row.is_group)
+        total = sum(row.size for row in self.rows if not row.is_dir and not row.is_group)
         out.append(f"{BOLD}{label}{RESET}\n")
         out.append(f"{DIM}{files} file(s) · {human_size(total)}{RESET}\n\n")
 
@@ -713,7 +819,7 @@ class Viewer:
             for line in tree:
                 out.append(line + "\n")
             entry = self.current()
-            title = fit(entry.path.name, max(0, width - 4)) if entry else ""
+            title = fit(entry.label, max(0, width - 4)) if entry else ""
             out.append(f"{DIM}{'─' * max(0, width - len(title) - 3)} {title} {RESET}\n")
             lines, image = self.preview_lines(width, preview_height)
             for line in lines[:preview_height]:

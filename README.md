@@ -39,10 +39,34 @@ lives somewhere unusual). No build step, no dependencies.
 
 ## What it docks, per agent
 
-| Agent | Directory |
+| Agent | Sources |
 | --- | --- |
 | Claude Code | the session scratchpad, `/tmp/claude-<uid>/<cwd-slug>/<session-uuid>/scratchpad` |
-| Codex | that thread's images, `~/.codex/generated_images/<thread-id>` |
+| Codex | that thread's images, `~/.codex/generated_images/<thread-id>`, **and** the repo's uncommitted changes |
+
+A Codex dock watches two places at once, shown as folding groups:
+
+```
+codex · 01a09b8d
+31 file(s) · 28.1M
+
+▾ generated images
+    exec-e66c892b-….png        1.5M   2m
+    exec-b4699e3f-….png        1.4M   3m
+▾ working tree
+  ?? screen_board_rose.c      16.6K   1m
+  M  gpu.c                    71.4K   3m
+  M  main.c                   31.2K   6m
+```
+
+That pairing is not decoration: images are the only thing Codex keeps per
+thread, so everything else it makes is only visible where it lands — in the
+repo. The working-tree group is `git status --porcelain`, which already leaves
+out ignored files, so build output and vendored trees stay out of the way. Set
+`GIT_CHANGES=0` for images alone.
+
+Claude Code's scratchpad already collects both kinds of output, so its dock
+stays a single ungrouped list.
 
 An agent without a resolver docks nothing. That is deliberate: the two layouts
 have nothing in common, and falling back to the other one would put a Claude
@@ -184,6 +208,7 @@ cp config.example.env "$(herdr plugin config-dir mvaios.scratchdock)/config.env"
 | `FOCUS` | `0` | `1` to focus the dock when it opens. |
 | `SCRATCHPAD_ROOT` | *(empty)* | Override `/tmp/claude-<uid>`. |
 | `CODEX_HOME` | *(empty)* | Override `~/.codex`. |
+| `GIT_CHANGES` | `1` | Pair a Codex dock with the repo's uncommitted changes. |
 | `VIEWER` | `builtin` | See below. |
 
 Every key also works as an environment variable with a `SCRATCHDOCK_` prefix.
@@ -210,8 +235,8 @@ directory.
 
 ## Limits
 
-- For Codex the dock shows generated images only — that is the one place Codex
-  keeps per-thread output. Its other working files land in the repo.
+- The working-tree group is per repository, not per thread: two Codex threads in
+  one checkout see the same changes. The images half stays exact.
 - Codex screenshots run past the 512 KiB inline limit, so those previews need
   `sips` and are macOS-only.
 - The dock never writes to the scratchpad. `o` and `e` hand a file to another

@@ -45,6 +45,8 @@ DEFAULTS = {
     "SCRATCHPAD_ROOT": "",
     # Override Codex's home; default is ~/.codex.
     "CODEX_HOME": "",
+    # Pair a Codex dock with the repo's uncommitted changes. 0 for images only.
+    "GIT_CHANGES": "1",
 }
 
 # argv0 basenames that count as the agent process inside a pane, per herdr agent id.
@@ -369,6 +371,25 @@ def resolve_source(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | None
     return resolver(pane_id, pane, cfg)
 
 
+def dock_sources(pane: dict, source: Path, cfg: dict[str, str]) -> list[dict]:
+    """The directories the dock should watch for this pane.
+
+    Codex keeps only images per thread — everything else it makes lands in the
+    repo — so its dock pairs the thread's images with whatever the working tree
+    has gained or changed. Claude Code's scratchpad already collects both, and
+    stays a single source.
+    """
+    sources = [{"label": source.name, "kind": "dir", "root": str(source)}]
+    if (pane.get("agent") or "") != "codex" or cfg["GIT_CHANGES"] != "1":
+        return sources
+    cwd = pane.get("cwd") or pane.get("foreground_cwd")
+    if not cwd:
+        return sources
+    sources[0]["label"] = "generated images"
+    sources.append({"label": "working tree", "kind": "git", "root": cwd})
+    return sources
+
+
 def source_label(pane: dict, source: Path) -> str:
     """What the dock calls itself, since the path alone does not read well.
 
@@ -500,6 +521,7 @@ def _open_dock_locked(agent_pane: str, cfg: dict[str, str], panes: dict[str, dic
         "--env", f"SCRATCHDOCK_DIR={scratchpad}",
         "--env", f"SCRATCHDOCK_AGENT_PANE={agent_pane}",
         "--env", f"SCRATCHDOCK_LABEL={source_label(pane, scratchpad)}",
+        "--env", f"SCRATCHDOCK_SOURCES={json.dumps(dock_sources(pane, scratchpad, cfg))}",
         "--focus" if cfg["FOCUS"] == "1" else "--no-focus",
     )
     dock_pane = (
