@@ -260,14 +260,83 @@ def birth_time(path: Path) -> float:
 
 
 
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def pid_alive(pid: object) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def claude_session(pid: int) -> tuple[str, str] | None:
+    """(session id, cwd) of the conversation the Claude process `pid` is showing.
+
+    Claude Code keeps a record per process at `~/.claude/sessions/<pid>.json` with
+    its current `sessionId`, rewritten on /clear. A conversation that has been
+    moved into a background job leaves `parkedJobId` behind in the pane's record,
+    and the work — and its scratchpad — continues in the background process whose
+    record carries that `jobId`. Returns None when there is no record (older
+    versions), so the caller can fall back to inference.
+    """
+    sessions = claude_config_dir() / "sessions"
+    record = read_json(sessions / f"{pid}.json")
+    if not record or not record.get("sessionId"):
+        return None
+    parked = record.get("parkedJobId")
+    if parked:
+        try:
+            candidates = list(sessions.glob("*.json"))
+        except OSError:
+            candidates = []
+        for path in candidates:
+            job = read_json(path)
+            if job and job.get("jobId") == parked and job.get("sessionId") and pid_alive(job.get("pid")):
+                record = job
+                break
+    cwd = record.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    return str(record["sessionId"]), cwd
+
+
 def resolve_claude_scratchpad(pane_id: str, pane: dict, cfg: dict[str, str]) -> Path | None:
     """The scratchpad directory of the agent session running in `pane_id`.
 
-    Sessions are per-process and per-cwd, so the cwd narrows the candidates to one
+    Exact when Claude Code's per-process session record exists (see
+    `claude_session`). Otherwise inferred: the cwd narrows the candidates to one
     project and the agent's process start time picks the session out of that
     project's history — including a session started mid-process by /clear, which
     is simply the newest one born after the process did.
     """
+    pid = agent_pid(pane_id, pane.get("agent") or "claude")
+    exact = claude_session(pid) if pid else None
+    if exact:
+        session_id, session_cwd = exact
+        scratchpad = scratchpad_root(cfg) / project_slug(session_cwd) / session_id / "scratchpad"
+        if not scratchpad.is_dir():
+            # This is the exact path Claude Code will use; it creates it lazily.
+            try:
+                scratchpad.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return None
+        return scratchpad
+
     cwd = pane.get("cwd") or pane.get("foreground_cwd")
     if not cwd:
         return None
@@ -279,7 +348,6 @@ def resolve_claude_scratchpad(pane_id: str, pane: dict, cfg: dict[str, str]) -> 
     if not sessions:
         return None
 
-    pid = agent_pid(pane_id, pane.get("agent") or "claude")
     started = process_start(pid) if pid else None
     if started is not None:
         own = [s for s in sessions if birth_time(s) >= started - START_SLACK]
@@ -400,6 +468,39 @@ def source_label(pane: dict, source: Path) -> str:
     if (pane.get("agent") or "") == "codex":
         return f"codex images · {source.name[:8]}"
     return f"{source.name} · {source.parent.name[:8]}"
+
+
+def dock_target(agent_pane: str, cfg: dict[str, str], panes: dict[str, dict] | None) -> dict | None:
+    """What the dock for `agent_pane` should be showing right now, or None if unknown."""
+    pane = (panes or {}).get(agent_pane)
+    if pane is None:
+        return None
+    source = resolve_source(agent_pane, pane, cfg)
+    if source is None:
+        return None
+    return {
+        "dir": str(source),
+        "label": source_label(pane, source),
+        "sources": dock_sources(pane, source, cfg),
+    }
+
+
+def retarget(agent_pane: str, cfg: dict[str, str], panes: dict[str, dict] | None) -> dict | None:
+    """Re-resolve an open dock and record the new target if the session moved.
+
+    The session behind a pane changes under a running dock — /clear, and a
+    conversation moved into a background job — so the directory picked at open
+    time goes stale. The dock's viewer follows the state file. Returns the new
+    target when it changed, else None.
+    """
+    state = load_state(agent_pane)
+    if not state.get("dock_pane"):
+        return None
+    target = dock_target(agent_pane, cfg, panes)
+    if not target or target["dir"] == state.get("dir"):
+        return None
+    save_state(agent_pane, {**state, **target})
+    return target
 
 
 # ------------------------------------------------------------------ dock opening
@@ -530,7 +631,12 @@ def _open_dock_locked(agent_pane: str, cfg: dict[str, str], panes: dict[str, dic
     if not dock_pane:
         return False, "herdr plugin pane open failed"
 
-    save_state(agent_pane, {"dock_pane": dock_pane, "dir": str(scratchpad)})
+    save_state(agent_pane, {
+        "dock_pane": dock_pane,
+        "dir": str(scratchpad),
+        "label": source_label(pane, scratchpad),
+        "sources": dock_sources(pane, scratchpad, cfg),
+    })
     resize_dock(dock_pane, cfg)
     return True, f"docked {scratchpad} in {dock_pane}"
 
@@ -669,10 +775,12 @@ def handle_event(cfg: dict[str, str]) -> int:
         close_dock(pane_id, snapshot_panes())
     elif status in open_on:
         panes = snapshot_panes()
-        # Cheap guard first: an already-docked pane must not cost a snapshot walk
-        # plus a `ps` on every single status flip of a busy agent.
         if not live_dock(pane_id, panes):
             open_dock(pane_id, cfg, panes)
+        else:
+            # Starting work is when a new session shows up (/clear, a resumed or
+            # backgrounded conversation), so check the open dock still points at it.
+            retarget(pane_id, cfg, panes)
     return 0
 
 

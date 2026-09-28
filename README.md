@@ -83,17 +83,28 @@ No birth-time heuristic of the kind Claude Code needs.
 ## How it finds the Claude scratchpad
 
 An agent pane gives you a cwd, not a session id, and one project accumulates a
-session directory per run. scratchdock narrows it in two steps:
+session directory per run — plus one per subagent. scratchdock asks Claude Code
+instead of guessing:
 
-1. The pane's cwd, flattened the way Claude Code names its temp directories
-   (`/Users/me/src/app` → `-Users-me-src-app`), picks the project.
-2. The agent process's start time picks the session out of that project's
-   history: the newest session directory born after the process did. That also
-   handles `/clear`, which starts a new session inside the same process.
+1. The agent process in the pane (found via `herdr pane process-info`) has a
+   record at `~/.claude/sessions/<pid>.json` naming its current `sessionId` and
+   `cwd`; Claude Code rewrites it on `/clear`.
+2. A conversation moved into a background job leaves `parkedJobId` in that
+   record, and carries on in the background process whose record has the
+   matching `jobId` — so the dock follows it there.
+3. The scratchpad is `/tmp/claude-<uid>/<cwd-slug>/<sessionId>/scratchpad`.
 
-It is a heuristic, and it has one blind spot: two agents running in the *same*
-directory at the same time can resolve to the same session. Everything else —
-worktrees, several projects, several panes — maps cleanly.
+**The dock follows the session.** The session behind a pane changes while the
+dock is open, so the viewer re-reads that record every few seconds (a file read,
+no herdr call) and re-resolves fully through herdr every 30 seconds; when the
+session moved it switches to the new directory and says so in the status line.
+
+Without a session record (older Claude Code versions) it falls back to
+inference: the cwd picks the project and the newest session directory born after
+the agent process started picks the session. That inference is unreliable —
+Claude Code pre-starts spare processes long before they get a session, and
+subagents create session directories of their own in the same project — which
+is why the record is preferred whenever it exists.
 
 `herdr plugin action invoke mvaios.scratchdock.path` prints what it would dock, which is
 the quickest way to check it on your own setup.

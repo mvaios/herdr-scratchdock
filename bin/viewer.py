@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from pathlib import Path
@@ -28,21 +29,30 @@ from pathlib import Path
 ROOT = Path(os.environ.get("SCRATCHDOCK_DIR") or os.getcwd())
 
 
-def _sources() -> list["Source"]:
-    """What this dock watches, from SCRATCHDOCK_SOURCES, else just its own cwd."""
+def _sources(raw: object = None, root: Path | None = None) -> list["Source"]:
+    """What this dock watches: a sources list (JSON text or parsed), else just `root`.
+
+    Defaults to SCRATCHDOCK_SOURCES and the dock's own directory, which is what the
+    dock was opened with; a retarget hands in the new session's list instead.
+    """
     import json as _json
 
-    raw = os.environ.get("SCRATCHDOCK_SOURCES") or ""
-    if raw:
-        try:
-            return [
+    root = root or ROOT
+    if raw is None:
+        raw = os.environ.get("SCRATCHDOCK_SOURCES") or ""
+    try:
+        items = _json.loads(raw) if isinstance(raw, str) and raw else raw
+        if isinstance(items, list):
+            sources = [
                 Source(item.get("label") or "", item.get("kind") or "dir", Path(item["root"]))
-                for item in _json.loads(raw)
-                if item.get("root")
+                for item in items
+                if isinstance(item, dict) and item.get("root")
             ]
-        except (ValueError, KeyError, TypeError):
-            pass
-    return [Source(ROOT.name, "dir", ROOT)]
+            if sources:
+                return sources
+    except (ValueError, KeyError, TypeError):
+        pass
+    return [Source(root.name, "dir", root)]
 AGENT_PANE = os.environ.get("SCRATCHDOCK_AGENT_PANE") or ""
 # What the header calls this directory. The dock is handed one because the path
 # alone does not read well for either agent: a Claude scratchpad is named for
@@ -52,6 +62,12 @@ HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
 
 POLL = 0.25          # input responsiveness
 RESCAN = 1.0         # directory rescan
+# The session behind the agent pane can change while the dock is open (/clear, a
+# conversation moved into a background job). FOLLOW re-reads Claude Code's
+# per-process session record, which is a file read; FOLLOW_FULL re-resolves
+# through herdr, for agents without such a record and to pick up a new pid.
+FOLLOW = 3.0
+FOLLOW_FULL = 30.0
 FORCE_REDRAW = 15.0  # so the age column stays honest while nothing changes
 MAX_DEPTH = 6
 MAX_ENTRIES = 2000
@@ -545,9 +561,96 @@ HELP = [
 ]
 
 
+def _load_dock():
+    """dock.py, for re-resolving the agent's session; None if it cannot be imported."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import dock  # noqa: PLC0415 - optional, and only inside a herdr dock pane
+        return dock
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class Follower:
+    """Tracks which directory the dock's agent is using, off the UI thread."""
+
+    def __init__(self, agent_pane: str) -> None:
+        self.agent_pane = agent_pane
+        self.dock = _load_dock() if agent_pane else None
+        self.cfg = self.dock.config() if self.dock else {}
+        self.pid: int | None = None
+        self.agent = ""
+        self.last_full = 0.0
+        self.last_fast = 0.0
+        self.worker: threading.Thread | None = None
+        self.result: dict | None = None     # new target, picked up by the UI loop
+
+    def tick(self, current_dir: str) -> dict | None:
+        """Called from the UI loop; returns a new target once, when the session moved."""
+        if not self.dock:
+            return None
+        now = time.time()
+        if self.result is not None:
+            result, self.result = self.result, None
+            return result if result.get("dir") != current_dir else None
+        if self.worker is not None and self.worker.is_alive():
+            return None
+        full_due = now - self.last_full >= FOLLOW_FULL or (self.agent == "claude" and not self.pid)
+        if full_due:
+            self.last_full = self.last_fast = now
+            self.worker = threading.Thread(target=self._full, args=(current_dir,), daemon=True)
+            self.worker.start()
+            return None
+        if now - self.last_fast >= FOLLOW and self.agent == "claude" and self.pid:
+            self.last_fast = now
+            target = self._fast()
+            if target and target["dir"] != current_dir:
+                return target
+        return None
+
+    def _fast(self) -> dict | None:
+        if not self.dock.pid_alive(self.pid):
+            self.pid = None
+            return None
+        exact = self.dock.claude_session(self.pid)
+        if not exact:
+            return None
+        session_id, cwd = exact
+        path = self.dock.scratchpad_root(self.cfg) / self.dock.project_slug(cwd) / session_id / "scratchpad"
+        pane = {"agent": "claude"}
+        return {"dir": str(path), "label": self.dock.source_label(pane, path),
+                "sources": self.dock.dock_sources(pane, path, self.cfg)}
+
+    def _full(self, current_dir: str) -> None:
+        try:
+            panes = self.dock.snapshot_panes()
+            pane = (panes or {}).get(self.agent_pane)
+            if not pane:
+                return
+            self.agent = pane.get("agent") or ""
+            self.pid = self.dock.agent_pid(self.agent_pane, self.agent) if self.agent else None
+            target = self.dock.dock_target(self.agent_pane, self.cfg, panes)
+            if target and target["dir"] != current_dir:
+                self.result = target
+        except Exception:  # noqa: BLE001 - following is best effort
+            pass
+
+    def record(self, target: dict) -> None:
+        """Persist the new target so actions (`path`, `reveal`, …) agree with the dock."""
+        try:
+            state = self.dock.load_state(self.agent_pane)
+            if state.get("dock_pane"):
+                self.dock.save_state(self.agent_pane, {**state, **target})
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class Viewer:
     def __init__(self) -> None:
+        self.root = ROOT
+        self.label = LABEL
         self.sources = _sources()
+        self.follower = Follower(AGENT_PANE)
         self.rows: list[Entry] = []
         self.collapsed: set[Path] = set()
         self.selected = 0
@@ -593,6 +696,24 @@ class Viewer:
                 else:
                     self.selected = min(self.selected, max(0, len(self.rows) - 1))
 
+    def follow(self) -> None:
+        """Switch to the agent's current session if it moved since the dock opened."""
+        target = self.follower.tick(str(self.root))
+        if not target:
+            return
+        self.root = Path(target["dir"])
+        self.label = target.get("label") or ""
+        self.sources = _sources(target.get("sources") or [], self.root)
+        self.collapsed.clear()
+        self.selected = self.top = 0
+        self.signature = None
+        clear_image()
+        self.image_shown = False
+        self.image_key = None
+        self.follower.record(target)
+        self.rescan()
+        self.say(f"followed the agent to {self.label or self.root.name}")
+
     def say(self, message: str) -> None:
         self.status = message
         self.status_until = time.time() + 4
@@ -613,7 +734,7 @@ class Viewer:
 
     def act_reveal(self) -> None:
         entry = self.current()
-        target = entry.path if entry else ROOT
+        target = entry.path if entry else self.root
         launcher = opener()
         if not launcher:
             self.say("no opener (open/xdg-open) on PATH")
@@ -632,7 +753,7 @@ class Viewer:
             return
         editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
         # Open beside the dock rather than over it, so the tree stays visible.
-        doc = run_json([HERDR, "pane", "split", "--pane", own_pane(), "--direction", "down", "--cwd", str(ROOT), "--focus"])
+        doc = run_json([HERDR, "pane", "split", "--pane", own_pane(), "--direction", "down", "--cwd", str(self.root), "--focus"])
         pane = (doc or {}).get("result", {}).get("pane", {}).get("pane_id")
         if not pane:
             self.say("could not split a pane for the editor")
@@ -652,7 +773,7 @@ class Viewer:
 
     def act_copy(self) -> None:
         entry = self.current()
-        target = str(entry.path if entry else ROOT)
+        target = str(entry.path if entry else self.root)
         self.say("copied path" if copy_to_clipboard(target) else "no clipboard tool found")
 
     def act_enter(self, toggle: bool = True) -> None:
@@ -789,7 +910,7 @@ class Viewer:
         now = time.time()
         out = ["\033[H\033[2J"]
 
-        label = LABEL or f"{ROOT.name} · {ROOT.parent.name[:8]}"
+        label = self.label or f"{self.root.name} · {self.root.parent.name[:8]}"
         if " · " in label:
             head, _, tail = label.partition(" · ")
             label = f"{head} {DIM}·{RESET}{BOLD} {tail}"
@@ -1002,6 +1123,7 @@ class Viewer:
         while True:
             now = time.time()
             if now - last_scan >= RESCAN:
+                self.follow()
                 self.rescan()
                 last_scan = now
             if self.dirty or now - self.last_draw > FORCE_REDRAW:
